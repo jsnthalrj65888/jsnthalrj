@@ -1,0 +1,13 @@
+# 代理列表示例文件
+# 每行一个代理，格式：
+# http://IP:端口
+# http://用户名:密码@IP:端口
+# https://IP:端口
+
+# 示例（请替换为实际的代理）:
+# http://127.0.0.1:7890
+# http://proxy1.example.com:8080
+# http://user:pass@proxy2.example.com:3128
+# https://10.0.0.1:1080
+
+# 你可以复制此文件为 proxies.txt 并填入真实的代理地址
