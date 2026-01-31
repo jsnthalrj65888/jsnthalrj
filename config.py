@@ -12,6 +12,12 @@ class Config:
     
     MAX_DEPTH = int(os.getenv('MAX_DEPTH', '3'))
     
+    # 新增：列表页数量
+    LIST_PAGES = int(os.getenv('LIST_PAGES', '1'))
+    
+    # 新增：详情页分页深度
+    DETAIL_DEPTH = int(os.getenv('DETAIL_DEPTH', '2'))
+    
     MAX_PAGES = int(os.getenv('MAX_PAGES', '50'))
     
     OUTPUT_DIR = os.getenv('OUTPUT_DIR', 'output')

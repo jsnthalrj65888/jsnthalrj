@@ -2,6 +2,7 @@ import os
 import time
 import random
 import hashlib
+import re
 from urllib.parse import urljoin, urlparse
 from typing import Set, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -47,6 +48,7 @@ class ImageCrawler:
         
         self.stats = {
             'pages_crawled': 0,
+            'photos_found': 0,
             'images_found': 0,
             'images_downloaded': 0,
             'images_failed': 0,
@@ -231,6 +233,109 @@ class ImageCrawler:
         except Exception as e:
             self.logger.warning(f"页面加载等待异常: {str(e)}")
     
+    def _extract_image_url_from_style(self, style: str) -> str:
+        """从 style 属性中提取 background-image URL"""
+        match = re.search(r'url\(["\']?(.*?)["\']?\)', style)
+        if match:
+            return match.group(1)
+        return None
+
+    def _generate_list_page_urls(self, list_pages: int) -> List[str]:
+        """根据列表页数量生成所有列表页URL"""
+        urls = []
+        for page in range(1, list_pages + 1):
+            if page == 1:
+                url = self.config.START_URL
+            else:
+                if '?' in self.config.START_URL:
+                    url = f"{self.config.START_URL}&page={page}"
+                else:
+                    url = f"{self.config.START_URL}?page={page}"
+            urls.append(url)
+        return urls
+
+    def _crawl_photo_detail(self, photo_url: str, max_pages: int):
+        """爬取单个套图的详情页（可能有多个分页）"""
+        try:
+            # 提取 photo_id
+            # 示例: https://8se.me/photo/id-697cc68a53ac0.html -> 697cc68a53ac0
+            # 或者: https://8se.me/photo/id-697cc68a53ac0/1.html -> 697cc68a53ac0
+            photo_id = photo_url.split('id-')[-1].split('.')[0].split('/')[0] if '/id-' in photo_url else None
+            
+            if not photo_id:
+                self.logger.warning(f"无法从URL提取photo_id: {photo_url}")
+                return
+            
+            # 使用同一个driver处理所有分页，减少启动开销
+            driver = None
+            proxy_config = None
+            
+            try:
+                if self.proxy_manager:
+                    proxy_config = self.proxy_manager.get_proxy()
+                driver = self._create_driver(proxy_config)
+
+                for page in range(1, max_pages + 1):
+                    page_url = f"https://8se.me/photo/id-{photo_id}/{page}.html"
+                    self.logger.info(f"  爬取套图分页: {page}/{max_pages} -> {page_url}")
+                    
+                    try:
+                        driver.get(page_url)
+                        time.sleep(self.config.MIN_DELAY) # 使用配置的延迟
+                        
+                        soup = BeautifulSoup(driver.page_source, 'html.parser')
+                        
+                        # 提取该分页的所有图片
+                        photo_images = soup.find_all('div', class_='item photo-image')
+                        
+                        image_urls = []
+                        for img_item in photo_images:
+                            # 提取图片信息
+                            img_div = img_item.find('div', class_='img')
+                            if img_div and img_div.get('style'):
+                                # 从 background-image 提取URL
+                                img_url = self._extract_image_url_from_style(img_div['style'])
+                                if img_url:
+                                    if not img_url.startswith('http'):
+                                        img_url = urljoin(page_url, img_url)
+                                    image_urls.append(img_url)
+                        
+                        if image_urls:
+                            self.stats['images_found'] += len(image_urls)
+                            # 下载图片，以 photo_id 为子目录
+                            self._download_images(image_urls, photo_id)
+                        
+                        self.stats['pages_crawled'] += 1
+                        
+                        # 检查是否还有下一页
+                        pager = soup.find('div', class_='pager')
+                        if pager:
+                            next_link = pager.find('a', class_='next')
+                            if not next_link or 'disabled' in next_link.get('class', []):
+                                self.logger.info(f"  套图 {photo_id} 已到最后一页")
+                                break
+                        else:
+                            # 如果没发现分页器，可能就一页
+                            break
+                        
+                    except Exception as e:
+                        self.logger.warning(f"爬取分页失败 {page_url}: {e}")
+                        break
+                        
+                if self.proxy_manager and proxy_config:
+                    self.proxy_manager.mark_proxy_success()
+                    
+            except Exception as e:
+                self.logger.error(f"处理套图详情页出错 {photo_url}: {e}")
+                if self.proxy_manager and proxy_config:
+                    self.proxy_manager.mark_proxy_failed()
+            finally:
+                if driver:
+                    driver.quit()
+        
+        except Exception as e:
+            self.logger.error(f"处理套图详情页逻辑出错 {photo_url}: {e}")
+
     def crawl_page(self, url: str, depth: int = 0) -> List[str]:
         """爬取单个页面，返回页面中的链接（Selenium版本）"""
         if depth > self.config.MAX_DEPTH:
@@ -488,26 +593,86 @@ class ImageCrawler:
         return False
     
     def crawl(self):
-        """开始爬取"""
-        self.logger.info(f"=" * 60)
-        self.logger.info(f"开始爬取 (Selenium版本): {self.config.START_URL}")
-        self.logger.info(f"最大深度: {self.config.MAX_DEPTH}, 最大页面数: {self.config.MAX_PAGES}")
-        self.logger.info(f"输出目录: {self.config.OUTPUT_DIR}")
-        self.logger.info(f"使用代理: {self.config.USE_PROXY}")
-        self.logger.info(f"=" * 60)
-        
-        queue = [(self.config.START_URL, 0)]
-        
-        while queue and self.stats['pages_crawled'] < self.config.MAX_PAGES:
-            url, depth = queue.pop(0)
+        """
+        主爬取方法，根据 list_pages 参数爬取多个列表页
+        """
+        try:
+            self.logger.info(f"=" * 60)
+            self.logger.info(f"开始爬取 (8se.me 优化版): {self.config.START_URL}")
+            self.logger.info(f"列表页数: {self.config.LIST_PAGES}, 套图深度: {self.config.DETAIL_DEPTH}")
+            self.logger.info(f"输出目录: {self.config.OUTPUT_DIR}")
+            self.logger.info(f"使用代理: {self.config.USE_PROXY}")
+            self.logger.info(f"=" * 60)
+
+            # 获取所有列表页URL
+            list_urls = self._generate_list_page_urls(self.config.LIST_PAGES)
+            self.logger.info(f"将爬取 {len(list_urls)} 页列表页")
             
-            links = self.crawl_page(url, depth)
+            all_photo_urls = []
             
-            for link in links:
-                if link not in self.visited_urls:
-                    queue.append((link, depth + 1))
-        
-        self._print_stats()
+            # 1. 爬取所有列表页，收集套图详情页URL
+            driver = None
+            proxy_config = None
+            try:
+                if self.proxy_manager:
+                    proxy_config = self.proxy_manager.get_proxy()
+                driver = self._create_driver(proxy_config)
+
+                for idx, list_url in enumerate(list_urls, 1):
+                    self.logger.info(f"爬取列表页 {idx}/{len(list_urls)}: {list_url}")
+                    
+                    try:
+                        driver.get(list_url)
+                        time.sleep(self.config.MIN_DELAY)
+                        
+                        # 解析页面，提取套图链接
+                        soup = BeautifulSoup(driver.page_source, 'html.parser')
+                        photo_items = soup.find_all('div', class_='item photo')
+                        
+                        page_count = len(photo_items)
+                        self.logger.info(f"列表页 {idx} 发现 {page_count} 个套图")
+                        
+                        # 提取每个套图的详情页URL
+                        for item in photo_items:
+                            link = item.find('a')
+                            if link and 'href' in link.attrs:
+                                photo_url = link['href']
+                                if not photo_url.startswith('http'):
+                                    photo_url = urljoin(self.config.START_URL, photo_url)
+                                
+                                if photo_url not in all_photo_urls:
+                                    all_photo_urls.append(photo_url)
+                                    # self.logger.debug(f"发现套图: {photo_url}")
+                        
+                        self.stats['pages_crawled'] += 1
+                    except Exception as e:
+                        self.logger.error(f"处理列表页失败 {list_url}: {e}")
+                
+                if self.proxy_manager and proxy_config:
+                    self.proxy_manager.mark_proxy_success()
+            finally:
+                if driver:
+                    driver.quit()
+            
+            self.logger.info(f"总共发现 {len(all_photo_urls)} 个套图")
+            self.stats['photos_found'] = len(all_photo_urls)
+            
+            # 2. 对每个套图进行深度爬取（分页）
+            for photo_idx, photo_url in enumerate(all_photo_urls, 1):
+                self.logger.info(f"正在处理套图 {photo_idx}/{len(all_photo_urls)}: {photo_url}")
+                
+                # 调用详情页爬取方法
+                self._crawl_photo_detail(photo_url, self.config.DETAIL_DEPTH)
+                
+                # 请求延迟
+                time.sleep(self.config.MIN_DELAY)
+            
+            self.logger.info(f"爬取完成！共处理 {len(all_photo_urls)} 个套图")
+            
+        except Exception as e:
+            self.logger.error(f"爬虫执行出错: {e}")
+        finally:
+            self._print_stats()
     
     def _print_stats(self):
         """打印统计信息"""
@@ -517,7 +682,9 @@ class ImageCrawler:
         self.logger.info(f"爬取完成！统计信息:")
         self.logger.info(f"=" * 60)
         self.logger.info(f"总耗时: {elapsed_time:.2f} 秒")
-        self.logger.info(f"页面爬取数: {self.stats['pages_crawled']}")
+        self.logger.info(f"列表页爬取数: {self.config.LIST_PAGES}")
+        self.logger.info(f"总页面爬取数: {self.stats['pages_crawled']}")
+        self.logger.info(f"套图发现数: {self.stats['photos_found']}")
         self.logger.info(f"图片发现数: {self.stats['images_found']}")
         self.logger.info(f"图片下载成功: {self.stats['images_downloaded']}")
         self.logger.info(f"图片下载失败: {self.stats['images_failed']}")
