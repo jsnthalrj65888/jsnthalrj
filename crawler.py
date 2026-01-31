@@ -3,6 +3,7 @@ import time
 import random
 import hashlib
 import re
+import base64
 from urllib.parse import urljoin, urlparse
 from typing import Set, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -120,10 +121,20 @@ class ImageCrawler:
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
     
-    def _create_driver(self, proxy_config=None):
+    def _create_driver(self, proxy_config=None, download_dir=None):
         """创建WebDriver（Selenium版本替代Playwright浏览器）"""
         chrome_options = Options()
         
+        # 设置偏好
+        prefs = {
+            'profile.managed_default_content_settings.images': 2,  # 禁用图片加载
+            'profile.default_content_setting_values.notifications': 2,
+        }
+        if download_dir:
+            prefs['download.default_directory'] = os.path.abspath(download_dir)
+            
+        chrome_options.add_experimental_option('prefs', prefs)
+
         # 基础选项
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
@@ -254,6 +265,115 @@ class ImageCrawler:
             urls.append(url)
         return urls
 
+    def _get_image_filename(self, url: str, photo_id: str) -> str:
+        """生成图片文件名"""
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        ext = os.path.splitext(urlparse(url).path)[1] or '.jpg'
+        return f"{url_hash}{ext}"
+
+    def _download_image_via_selenium(self, driver, img_url, photo_id, output_dir):
+        """
+        使用 Selenium 浏览器打开图片URL 进行下载
+        这样可以完全绕过 CDN 的反爬虫检查
+        """
+        max_retries = 3
+        filename = self._get_image_filename(img_url, photo_id)
+        filepath = os.path.join(output_dir, filename)
+        
+        if os.path.exists(filepath) and self.config.SKIP_EXISTING:
+            self.logger.debug(f"文件已存在，跳过: {filename}")
+            self.downloaded_images.add(img_url)
+            self.stats['images_skipped'] += 1
+            return True
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.logger.debug(f"尝试下载 (Selenium, 尝试 {attempt}/{max_retries}): {img_url}")
+                
+                # 在新标签页中打开图片URL
+                driver.execute_script(f"window.open('{img_url}', '_blank');")
+                
+                # 切换到新标签页
+                driver.switch_to.window(driver.window_handles[-1])
+                
+                # 等待加载，虽然禁用了图片，但文档加载还是需要的
+                # 我们可以等待 document.readyState
+                try:
+                    WebDriverWait(driver, 10).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                    )
+                except:
+                    pass
+                
+                # 使用 JavaScript 触发 XHR 下载并返回 base64
+                # 这种方法即使在禁用图片显示的情况下也工作，只要网络请求能成功
+                script = """
+                var url = arguments[0];
+                var callback = arguments[1];
+                var xhr = new XMLHttpRequest();
+                xhr.open('GET', url, true);
+                xhr.responseType = 'blob';
+                xhr.onload = function() {
+                    var reader = new FileReader();
+                    reader.readAsDataURL(xhr.response);
+                    reader.onloadend = function() {
+                        callback(reader.result);
+                    }
+                };
+                xhr.onerror = function() {
+                    callback(null);
+                };
+                xhr.send();
+                """
+                
+                base64_data = driver.execute_async_script(script, img_url)
+                
+                if base64_data:
+                    # 移除 data:image/xxx;base64, 前缀
+                    if ',' in base64_data:
+                        base64_data = base64_data.split(',')[1]
+                    
+                    image_data = base64.b64decode(base64_data)
+                    
+                    if len(image_data) < self.config.MIN_IMAGE_SIZE:
+                        self.logger.warning(f"下载的图片太小: {len(image_data)} bytes")
+                    else:
+                        with open(filepath, 'wb') as f:
+                            f.write(image_data)
+                        
+                        self.logger.info(f"下载成功: {filename} ({len(image_data)} bytes)")
+                        self.downloaded_images.add(img_url)
+                        self.stats['images_downloaded'] += 1
+                        
+                        # 关闭新标签页
+                        driver.close()
+                        driver.switch_to.window(driver.window_handles[0])
+                        return True
+                
+                # 如果 JS 方法失败，关闭标签页重试
+                driver.close()
+                driver.switch_to.window(driver.window_handles[0])
+                time.sleep(1)
+                
+            except Exception as e:
+                self.logger.warning(f"下载失败 (尝试 {attempt}/{max_retries}): {str(e)[:100]}")
+                
+                # 关闭额外标签页并返回主标签页
+                try:
+                    while len(driver.window_handles) > 1:
+                        driver.switch_to.window(driver.window_handles[-1])
+                        driver.close()
+                    driver.switch_to.window(driver.window_handles[0])
+                except:
+                    pass
+                
+                if attempt < max_retries:
+                    time.sleep(2)
+        
+        self.stats['images_failed'] += 1
+        self.logger.error(f"最终下载失败，已放弃: {img_url}")
+        return False
+
     def _crawl_photo_detail(self, photo_url: str, max_pages: int):
         """爬取单个套图的详情页（可能有多个分页）"""
         try:
@@ -266,6 +386,11 @@ class ImageCrawler:
                 self.logger.warning(f"无法从URL提取photo_id: {photo_url}")
                 return
             
+            # 准备输出目录
+            output_dir = os.path.join(self.config.OUTPUT_DIR, photo_id)
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            
             # 使用同一个driver处理所有分页，减少启动开销
             driver = None
             proxy_config = None
@@ -273,7 +398,9 @@ class ImageCrawler:
             try:
                 if self.proxy_manager:
                     proxy_config = self.proxy_manager.get_proxy()
-                driver = self._create_driver(proxy_config)
+                
+                # 创建带有下载目录配置的Driver
+                driver = self._create_driver(proxy_config, download_dir=output_dir)
 
                 for page in range(1, max_pages + 1):
                     page_url = f"https://8se.me/photo/id-{photo_id}/{page}.html"
@@ -288,13 +415,11 @@ class ImageCrawler:
                         # 提取该分页的所有图片
                         photo_images = soup.find_all('div', class_='item photo-image')
                         
-                        image_urls = []
-                        show_urls = []  # 对应的photoShow页面URL
+                        self.logger.info(f"  发现 {len(photo_images)} 张图片")
                         
                         for img_item in photo_images:
                             # 提取图片信息
                             img_div = img_item.find('div', class_='img')
-                            a_tag = img_item.find('a')
                             
                             if img_div and img_div.get('style'):
                                 # 从 background-image 提取URL
@@ -302,21 +427,14 @@ class ImageCrawler:
                                 if img_url:
                                     if not img_url.startswith('http'):
                                         img_url = urljoin(page_url, img_url)
-                                    image_urls.append(img_url)
                                     
-                                    # 获取对应的show_url
-                                    show_url = None
-                                    if a_tag and 'href' in a_tag.attrs:
-                                        show_url = a_tag['href']
-                                        if not show_url.startswith('http'):
-                                            show_url = urljoin(self.config.START_URL, show_url)
+                                    self.stats['images_found'] += 1
                                     
-                                    show_urls.append(show_url)
-                        
-                        if image_urls:
-                            self.stats['images_found'] += len(image_urls)
-                            # 下载图片，以 photo_id 为子目录
-                            self._download_images(image_urls, photo_id, show_urls)
+                                    # 使用 Selenium 直接下载
+                                    self._download_image_via_selenium(driver, img_url, photo_id, output_dir)
+                                    
+                                    # 图片间稍微延迟，避免太快
+                                    time.sleep(0.5)
                         
                         self.stats['pages_crawled'] += 1
                         
