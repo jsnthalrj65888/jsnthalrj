@@ -111,6 +111,20 @@ http://user:pass@proxy2.example.com:3128
 python main.py --use-proxy
 ```
 
+### 使用Cookie登录态（可选）
+
+1. 准备包含Cookie的JSON文件（列表格式），例如:
+```json
+[
+  {"name": "sessionid", "value": "your_value", "domain": "8se.me", "path": "/"}
+]
+```
+
+2. 运行爬虫时指定Cookie文件：
+```bash
+python main.py --cookie-file cookies.json
+```
+
 **方式二：在 config.py 中配置**
 
 编辑 `config.py` 文件，修改 `PROXY_LIST`：
@@ -143,6 +157,7 @@ python main.py [选项]
   --use-proxy            使用代理
   --proxy-file FILE      代理列表文件 (默认: proxies.txt)
   --no-headless          显示浏览器窗口
+  --cookie-file FILE     Cookie文件路径 (默认: cookies.json)
   --min-delay SECONDS    最小请求延迟 (默认: 1)
   --max-delay SECONDS    最大请求延迟 (默认: 3)
   --no-skip-existing     不跳过已存在的文件
@@ -165,6 +180,7 @@ MAX_DEPTH=3
 MAX_PAGES=50
 USE_PROXY=false
 HEADLESS=true
+COOKIE_FILE=cookies.json
 ```
 
 ### config.py 配置文件
@@ -181,6 +197,7 @@ MAX_DELAY = 3                            # 最大延迟（秒）
 MAX_WORKERS = 5                          # 下载线程数
 USE_PROXY = False                        # 是否使用代理
 HEADLESS = True                          # 无头模式
+COOKIE_FILE = 'cookies.json'             # Cookie文件路径
 RESPECT_ROBOTS_TXT = True                # 遵守robots.txt
 MIN_IMAGE_SIZE = 10240                   # 最小图片大小（字节）
 ```

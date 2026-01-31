@@ -2,17 +2,15 @@ import os
 import time
 import random
 import hashlib
-import asyncio
 from urllib.parse import urljoin, urlparse
-from typing import Set, List, Optional
+from typing import Set, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 from PIL import Image
 from io import BytesIO
-from playwright.sync_api import sync_playwright, Page, Browser
+from playwright.sync_api import sync_playwright
 from urllib.robotparser import RobotFileParser
 from tqdm import tqdm
 
@@ -48,7 +46,11 @@ class ImageCrawler:
             'images_skipped': 0,
             'start_time': time.time()
         }
-        
+
+        self.cookies = self.config.load_cookies()
+        if self.cookies:
+            self.logger.info(f"已加载 {len(self.cookies)} 条Cookie")
+
         if not os.path.exists(config.OUTPUT_DIR):
             os.makedirs(config.OUTPUT_DIR)
             self.logger.info(f"创建输出目录: {config.OUTPUT_DIR}")
@@ -114,66 +116,69 @@ class ImageCrawler:
         if depth > self.config.MAX_DEPTH:
             self.logger.debug(f"达到最大深度，跳过: {url}")
             return []
-        
+
         if url in self.visited_urls:
             self.logger.debug(f"URL已访问过，跳过: {url}")
             return []
-        
+
         if self.stats['pages_crawled'] >= self.config.MAX_PAGES:
             self.logger.info(f"达到最大页面数限制: {self.config.MAX_PAGES}")
             return []
-        
+
         if not self.can_fetch(url):
             self.logger.warning(f"robots.txt禁止访问: {url}")
             return []
-        
+
         self.visited_urls.add(url)
         self.logger.info(f"爬取页面 (深度 {depth}): {url}")
-        
+
         try:
             with sync_playwright() as p:
                 browser_args = {
                     'headless': self.config.HEADLESS,
                 }
-                
+
                 proxy_config = None
                 if self.proxy_manager:
                     proxy_config = self.proxy_manager.get_proxy()
                     if proxy_config:
                         browser_args['proxy'] = proxy_config
                         self.logger.debug(f"使用代理: {proxy_config['server']}")
-                
+
                 browser = p.chromium.launch(**browser_args)
-                
+
                 context = browser.new_context(
                     user_agent=random.choice(self.config.USER_AGENTS),
                     viewport={'width': 1920, 'height': 1080}
                 )
-                
+
+                if self.cookies:
+                    context.add_cookies(self.cookies)
+
                 page = context.new_page()
                 page.set_default_timeout(self.config.TIMEOUT * 1000)
-                
+
                 try:
                     page.goto(url, wait_until='networkidle')
-                    
+
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     time.sleep(1)
-                    
+
                     content = page.content()
-                    
+
                     image_urls = self._extract_images_from_page(content, url)
                     self.stats['images_found'] += len(image_urls)
                     self.logger.info(f"在页面中找到 {len(image_urls)} 张图片")
-                    
+
                     page_name = self._get_page_name(url)
                     self._download_images(image_urls, page_name)
-                    
+
                     links = self._extract_links_from_page(content, url)
-                    
+
                     self.stats['pages_crawled'] += 1
-                    
+
                     return links
-                    
+
                 except Exception as e:
                     self.logger.error(f"页面加载失败 {url}: {str(e)}")
                     if self.proxy_manager and proxy_config:
@@ -181,7 +186,7 @@ class ImageCrawler:
                     return []
                 finally:
                     browser.close()
-        
+
         except Exception as e:
             self.logger.error(f"浏览器启动失败: {str(e)}")
             return []
@@ -285,7 +290,7 @@ class ImageCrawler:
                     'User-Agent': random.choice(self.config.USER_AGENTS),
                     'Referer': self.config.START_URL
                 }
-                
+
                 proxies = None
                 if self.proxy_manager:
                     proxy = self.proxy_manager.get_proxy()
@@ -295,16 +300,38 @@ class ImageCrawler:
                             'http': proxy_url,
                             'https': proxy_url
                         }
-                
+
+                cookie_jar = None
+                if self.cookies:
+                    cookie_jar = requests.cookies.RequestsCookieJar()
+                    for cookie in self.cookies:
+                        name = cookie.get('name')
+                        value = cookie.get('value')
+                        if not name or value is None:
+                            continue
+                        try:
+                            cookie_jar.set_cookie(
+                                requests.cookies.create_cookie(
+                                    name=name,
+                                    value=value,
+                                    domain=cookie.get('domain'),
+                                    path=cookie.get('path', '/'),
+                                    secure=cookie.get('secure', False)
+                                )
+                            )
+                        except Exception:
+                            continue
+
                 response = requests.get(
                     url,
                     headers=headers,
                     proxies=proxies,
                     timeout=self.config.TIMEOUT,
-                    stream=True
+                    stream=True,
+                    cookies=cookie_jar
                 )
                 response.raise_for_status()
-                
+
                 content = response.content
                 
                 if len(content) < self.config.MIN_IMAGE_SIZE:

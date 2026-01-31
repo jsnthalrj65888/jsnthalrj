@@ -74,6 +74,13 @@ def parse_arguments():
         action='store_true',
         help='显示浏览器窗口（非无头模式）'
     )
+
+    parser.add_argument(
+        '--cookie-file',
+        type=str,
+        default=Config.COOKIE_FILE,
+        help=f'Cookie文件路径 (默认: {Config.COOKIE_FILE})'
+    )
     
     parser.add_argument(
         '--min-delay',
@@ -113,6 +120,7 @@ def main():
         Config.USE_PROXY = args.use_proxy
         Config.PROXY_LIST_FILE = args.proxy_file
         Config.HEADLESS = not args.no_headless
+        Config.COOKIE_FILE = args.cookie_file
         Config.MIN_DELAY = args.min_delay
         Config.MAX_DELAY = args.max_delay
         Config.SKIP_EXISTING = not args.no_skip_existing
