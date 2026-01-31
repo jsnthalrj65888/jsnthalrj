@@ -289,9 +289,13 @@ class ImageCrawler:
                         photo_images = soup.find_all('div', class_='item photo-image')
                         
                         image_urls = []
+                        show_urls = []  # 对应的photoShow页面URL
+                        
                         for img_item in photo_images:
                             # 提取图片信息
                             img_div = img_item.find('div', class_='img')
+                            a_tag = img_item.find('a')
+                            
                             if img_div and img_div.get('style'):
                                 # 从 background-image 提取URL
                                 img_url = self._extract_image_url_from_style(img_div['style'])
@@ -299,11 +303,20 @@ class ImageCrawler:
                                     if not img_url.startswith('http'):
                                         img_url = urljoin(page_url, img_url)
                                     image_urls.append(img_url)
+                                    
+                                    # 获取对应的show_url
+                                    show_url = None
+                                    if a_tag and 'href' in a_tag.attrs:
+                                        show_url = a_tag['href']
+                                        if not show_url.startswith('http'):
+                                            show_url = urljoin(self.config.START_URL, show_url)
+                                    
+                                    show_urls.append(show_url)
                         
                         if image_urls:
                             self.stats['images_found'] += len(image_urls)
                             # 下载图片，以 photo_id 为子目录
-                            self._download_images(image_urls, photo_id)
+                            self._download_images(image_urls, photo_id, show_urls)
                         
                         self.stats['pages_crawled'] += 1
                         
@@ -317,6 +330,9 @@ class ImageCrawler:
                         else:
                             # 如果没发现分页器，可能就一页
                             break
+                        
+                        # 随机延迟，避免请求过于频繁
+                        time.sleep(0.5 + random.uniform(0, 1))
                         
                     except Exception as e:
                         self.logger.warning(f"爬取分页失败 {page_url}: {e}")
@@ -385,7 +401,7 @@ class ImageCrawler:
 
             # 下载图片
             page_name = self._get_page_name(url)
-            self._download_images(image_urls, page_name)
+            self._download_images_simple(image_urls, page_name)
 
             # 提取链接
             links = self._extract_links_from_page(content, url)
@@ -472,8 +488,35 @@ class ImageCrawler:
         
         return links
     
-    def _download_images(self, image_urls: List[str], page_name: str):
+    def _download_images(self, image_urls: List[str], photo_id: str, show_urls: List[str] = None):
         """下载图片列表"""
+        if not image_urls:
+            return
+        
+        output_dir = os.path.join(self.config.OUTPUT_DIR, photo_id)
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        self.logger.info(f"开始下载 {len(image_urls)} 张图片到 {output_dir}")
+        
+        with ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS) as executor:
+            futures = []
+            
+            for idx, url in enumerate(image_urls):
+                show_url = show_urls[idx] if show_urls and idx < len(show_urls) else None
+                future = executor.submit(self._download_single_image, url, output_dir, photo_id, show_url)
+                futures.append(future)
+            
+            with tqdm(total=len(image_urls), desc=f"下载图片 [{photo_id}]") as pbar:
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception as e:
+                        self.logger.warning(f"图片下载任务失败: {e}")
+                    pbar.update(1)
+    
+    def _download_images_simple(self, image_urls: List[str], page_name: str):
+        """下载图片列表（简单版本，用于一般页面）"""
         if not image_urls:
             return
         
@@ -485,17 +528,143 @@ class ImageCrawler:
         
         with ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS) as executor:
             futures = {
-                executor.submit(self._download_single_image, url, output_dir): url
+                executor.submit(self._download_single_image, url, output_dir, None, None): url
                 for url in image_urls
             }
             
             with tqdm(total=len(image_urls), desc=f"下载图片 [{page_name}]") as pbar:
                 for future in as_completed(futures):
-                    future.result()
+                    try:
+                        future.result()
+                    except Exception as e:
+                        self.logger.warning(f"图片下载任务失败: {e}")
                     pbar.update(1)
-    
-    def _download_single_image(self, url: str, output_dir: str) -> bool:
-        """下载单张图片"""
+
+    def _get_browser_headers(self, referer_url: str = None) -> dict:
+        """生成完整的浏览器请求头"""
+        headers = {
+            'User-Agent': random.choice(self.config.USER_AGENTS),
+            'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Sec-Fetch-Dest': 'image',
+            'Sec-Fetch-Mode': 'no-cors',
+            'Sec-Fetch-Site': 'cross-site',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+        }
+        
+        # 设置Referer头
+        if referer_url:
+            headers['Referer'] = referer_url
+        else:
+            headers['Referer'] = self.config.START_URL
+            
+        return headers
+
+    def _get_hq_image_url(self, thumb_url: str) -> List[str]:
+        """将缩略图URL转换为高清版本URL列表"""
+        urls_to_try = [thumb_url]
+        
+        # 提取基础信息
+        if '_600x0' in thumb_url:
+            base_url = thumb_url.replace('_600x0', '')
+            # 尝试不同分辨率
+            hq_urls = [
+                thumb_url.replace('_600x0', '_2000x0'),
+                thumb_url.replace('_600x0', '_1200x0'),
+                thumb_url.replace('_600x0', '_800x0'),
+                base_url + '.webp',
+                base_url + '.jpg',
+                base_url + '.jpeg',
+                base_url + '.png',
+            ]
+            urls_to_try.extend(hq_urls)
+        
+        return urls_to_try
+
+    def _get_image_from_photo_show_page(self, driver, photo_id: str) -> List[str]:
+        """访问photoShow页面获取高清图片链接"""
+        image_urls = []
+        
+        try:
+            # 构造photoShow页面URL
+            show_urls = [
+                f"https://8se.me/photoShow.html?id={photo_id}",
+                f"https://8se.me/photo/show/id-{photo_id}.html"
+            ]
+            
+            for show_url in show_urls:
+                try:
+                    self.logger.debug(f"访问photoShow页面: {show_url}")
+                    driver.get(show_url)
+                    time.sleep(2)
+                    
+                    soup = BeautifulSoup(driver.page_source, 'html.parser')
+                    
+                    # 查找图片标签
+                    img_tags = soup.find_all('img')
+                    for img in img_tags:
+                        src = img.get('src') or img.get('data-src') or img.get('data-original')
+                        if src and self._is_image_url(src):
+                            if not src.startswith('http'):
+                                src = urljoin(show_url, src)
+                            if src not in image_urls:
+                                image_urls.append(src)
+                    
+                    # 查找背景图片
+                    for div in soup.find_all('div', style=True):
+                        style = div.get('style', '')
+                        if 'background-image' in style:
+                            bg_url = self._extract_image_url_from_style(style)
+                            if bg_url:
+                                if not bg_url.startswith('http'):
+                                    bg_url = urljoin(show_url, bg_url)
+                                if bg_url not in image_urls:
+                                    image_urls.append(bg_url)
+                    
+                    if image_urls:
+                        self.logger.debug(f"从photoShow页面获取到 {len(image_urls)} 个图片链接")
+                        break
+                        
+                except Exception as e:
+                    self.logger.debug(f"photoShow页面访问失败 {show_url}: {e}")
+                    continue
+                    
+        except Exception as e:
+            self.logger.error(f"获取photoShow页面图片失败: {e}")
+        
+        return image_urls
+
+    def _get_current_cookies(self, driver=None) -> dict:
+        """获取当前浏览器会话的有效Cookie"""
+        try:
+            if driver:
+                # 获取Selenium的Cookie
+                selenium_cookies = driver.get_cookies()
+                cookie_dict = {}
+                for cookie in selenium_cookies:
+                    cookie_dict[cookie['name']] = cookie['value']
+                return cookie_dict
+            else:
+                # 返回配置文件中的Cookie
+                if self.cookies:
+                    cookie_dict = {}
+                    for cookie in self.cookies:
+                        name = cookie.get('name')
+                        value = cookie.get('value')
+                        if name and value:
+                            cookie_dict[name] = value
+                    return cookie_dict
+        except Exception as e:
+            self.logger.warning(f"获取Cookie失败: {e}")
+        return {}
+
+    def _download_single_image(self, url: str, output_dir: str, photo_id: str = None, show_url: str = None, driver=None) -> bool:
+        """下载单张图片（增强版，支持反爬虫对策）"""
         if url in self.downloaded_images:
             self.stats['images_skipped'] += 1
             return True
@@ -511,85 +680,131 @@ class ImageCrawler:
             self.stats['images_skipped'] += 1
             return True
         
-        for attempt in range(self.config.MAX_RETRIES):
-            try:
-                headers = {
-                    'User-Agent': random.choice(self.config.USER_AGENTS),
-                    'Referer': self.config.START_URL
-                }
-
-                proxies = None
-                if self.proxy_manager:
-                    proxy = self.proxy_manager.get_proxy()
-                    if proxy:
-                        proxy_url = proxy['server']
-                        proxies = {
-                            'http': proxy_url,
-                            'https': proxy_url
-                        }
-
-                cookie_jar = None
-                if self.cookies:
-                    cookie_jar = requests.cookies.RequestsCookieJar()
-                    for cookie in self.cookies:
-                        name = cookie.get('name')
-                        value = cookie.get('value')
-                        if not name or value is None:
-                            continue
-                        try:
-                            cookie_jar.set_cookie(
-                                requests.cookies.create_cookie(
-                                    name=name,
-                                    value=value,
-                                    domain=cookie.get('domain'),
-                                    path=cookie.get('path', '/'),
-                                    secure=cookie.get('secure', False)
-                                )
-                            )
-                        except Exception:
-                            continue
-
-                response = requests.get(
-                    url,
-                    headers=headers,
-                    proxies=proxies,
-                    timeout=self.config.TIMEOUT,
-                    stream=True,
-                    cookies=cookie_jar
-                )
-                response.raise_for_status()
-
-                content = response.content
-                
-                if len(content) < self.config.MIN_IMAGE_SIZE:
-                    self.logger.debug(f"图片太小，跳过: {url} ({len(content)} bytes)")
-                    self.stats['images_skipped'] += 1
-                    return False
-                
-                try:
-                    img = Image.open(BytesIO(content))
-                    img.verify()
-                except Exception as e:
-                    self.logger.warning(f"图片验证失败: {url} - {str(e)}")
-                    self.stats['images_failed'] += 1
-                    return False
-                
-                with open(filepath, 'wb') as f:
-                    f.write(content)
-                
-                self.downloaded_images.add(url)
-                self.stats['images_downloaded'] += 1
-                self.logger.debug(f"下载成功: {filename} ({len(content)} bytes)")
-                return True
-                
-            except Exception as e:
-                self.logger.warning(f"下载失败 (尝试 {attempt + 1}/{self.config.MAX_RETRIES}): {url} - {str(e)}")
-                if attempt == self.config.MAX_RETRIES - 1:
-                    self.stats['images_failed'] += 1
-                    if self.proxy_manager and proxies:
-                        self.proxy_manager.mark_proxy_failed()
-                time.sleep(1)
+        # 重试配置
+        max_retries = 5
+        retry_delays = [2, 3, 5, 8, 10]  # 递增延迟
         
+        # 获取完整的URL列表（缩略图 + 高清版本）
+        urls_to_try = self._get_hq_image_url(url)
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                # 如果是403错误且有photo_id，尝试从photoShow页面获取
+                if attempt == 3 and photo_id:
+                    driver = None
+                    try:
+                        self.logger.info(f"403错误，尝试通过photoShow页面获取高清图片: {photo_id}")
+                        driver = self._create_driver()
+                        show_image_urls = self._get_image_from_photo_show_page(driver, photo_id)
+                        if show_image_urls:
+                            # 将photoShow页面的URL添加到尝试列表前面
+                            urls_to_try = show_image_urls + urls_to_try
+                    finally:
+                        if driver:
+                            driver.quit()
+                
+                # 尝试不同的URL
+                current_url = None
+                for try_url in urls_to_try:
+                    self.logger.debug(f"尝试下载: {try_url}")
+                    
+                    headers = self._get_browser_headers(show_url or self.config.START_URL)
+                    
+                    proxies = None
+                    if self.proxy_manager:
+                        proxy = self.proxy_manager.get_proxy()
+                        if proxy:
+                            proxy_url = proxy['server']
+                            proxies = {
+                                'http': proxy_url,
+                                'https': proxy_url
+                            }
+
+                    # 使用当前有效的Cookie
+                    cookies = self._get_current_cookies(driver)
+
+                    response = requests.get(
+                        try_url,
+                        headers=headers,
+                        proxies=proxies,
+                        timeout=15,  # 增加超时时间
+                        stream=True,
+                        cookies=cookies,
+                        allow_redirects=True
+                    )
+
+                    # 检查响应状态
+                    if response.status_code == 200:
+                        # 验证是否为有效的图片
+                        content_type = response.headers.get('content-type', '').lower()
+                        if 'image' in content_type:
+                            content = response.content
+                            
+                            if len(content) < self.config.MIN_IMAGE_SIZE:
+                                self.logger.debug(f"图片太小，跳过: {try_url} ({len(content)} bytes)")
+                                continue  # 尝试下一个URL
+                            
+                            try:
+                                img = Image.open(BytesIO(content))
+                                img.verify()
+                            except Exception as e:
+                                self.logger.warning(f"图片验证失败: {try_url} - {str(e)}")
+                                continue  # 尝试下一个URL
+                            
+                            # 保存图片
+                            with open(filepath, 'wb') as f:
+                                f.write(content)
+                            
+                            self.downloaded_images.add(url)
+                            self.stats['images_downloaded'] += 1
+                            self.logger.info(f"下载成功: {filename} ({len(content)} bytes) from {try_url}")
+                            return True
+                        else:
+                            self.logger.debug(f"响应不是图片: {content_type} from {try_url}")
+                            continue
+                    
+                    elif response.status_code == 403:
+                        self.logger.warning(f"403 Forbidden: {try_url}")
+                        if attempt == max_retries - 1:
+                            break  # 最后一次尝试，不再尝试其他URL
+                        continue  # 尝试下一个URL
+                    
+                    elif response.status_code == 429:
+                        self.logger.warning(f"429 Too Many Requests: {try_url}")
+                        break  # 暂停所有重试
+                    
+                    elif response.status_code >= 500:
+                        self.logger.warning(f"服务器错误 {response.status_code}: {try_url}")
+                        continue  # 尝试下一个URL
+                    
+                    else:
+                        self.logger.debug(f"HTTP {response.status_code}: {try_url}")
+                        continue  # 尝试下一个URL
+                
+                # 如果尝试了所有URL都失败，进行延迟重试
+                if attempt < max_retries:
+                    delay = retry_delays[attempt - 1]
+                    self.logger.info(f"等待 {delay} 秒后重试... (尝试 {attempt}/{max_retries})")
+                    time.sleep(delay)
+                
+            except requests.exceptions.Timeout:
+                self.logger.warning(f"下载超时 (尝试 {attempt}/{max_retries}): {url}")
+                if attempt < max_retries:
+                    time.sleep(retry_delays[attempt - 1])
+            
+            except requests.exceptions.ConnectionError:
+                self.logger.warning(f"连接错误 (尝试 {attempt}/{max_retries}): {url}")
+                if attempt < max_retries:
+                    time.sleep(retry_delays[attempt - 1])
+            
+            except Exception as e:
+                self.logger.error(f"下载出错 (尝试 {attempt}/{max_retries}): {url} - {str(e)}")
+                if attempt < max_retries:
+                    time.sleep(retry_delays[attempt - 1])
+        
+        # 所有重试都失败了
+        self.stats['images_failed'] += 1
+        self.logger.error(f"最终下载失败，已放弃: {url}")
         return False
     
     def crawl(self):
