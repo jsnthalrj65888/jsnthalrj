@@ -2,10 +2,19 @@
 
 一个功能完整的Python图片爬虫系统，支持浏览器模拟、代理轮换、递归爬取等高级功能。
 
+## 🔄 版本更新说明
+
+**最新版本已从 Playwright 迁移到 Selenium！**
+
+- ✅ **更好的 Windows 兼容性**: Selenium 在 Windows 环境下运行更稳定
+- ✅ **自动驱动管理**: 使用 webdriver-manager 自动管理 ChromeDriver
+- ✅ **更少的依赖**: 移除 playwright 依赖，降低安装复杂性
+- ✅ **更好的性能**: 同步操作减少异步复杂性
+
 ## ✨ 功能特性
 
 ### 核心功能
-- 🌐 **浏览器模拟**: 使用 Playwright 模拟真实浏览器操作
+- 🌐 **浏览器模拟**: 使用 Selenium WebDriver 模拟真实浏览器操作
 - 🔄 **代理支持**: 完整的代理池管理和轮换机制
 - 🔗 **递归爬取**: 支持多层级页面递归爬取
 - 📥 **并发下载**: 多线程并发下载图片
@@ -64,8 +73,10 @@ source venv/bin/activate
 # 安装 Python 依赖
 pip install -r requirements.txt
 
-# 安装 Playwright 浏览器
-playwright install chromium
+# 安装 Chrome 浏览器（如果未安装）
+# Windows: 下载并安装 Chrome
+# Linux: sudo apt-get install google-chrome-stable
+# macOS: brew install --cask google-chrome
 ```
 
 #### 2. 基本使用
@@ -325,29 +336,42 @@ logs/
 
 ## 🐛 常见问题
 
-### Q1: 安装 Playwright 失败
+### Q1: 安装 Selenium 后运行失败
 
+确保已安装 Chrome 浏览器：
 ```bash
-# 尝试手动安装
-python -m playwright install chromium
+# Windows: 下载并安装 Google Chrome
+# Linux:
+sudo apt-get install google-chrome-stable
 
-# 或者安装所有浏览器
-python -m playwright install
+# 验证 Chrome 是否正确安装
+google-chrome --version
 ```
 
-### Q2: 代理连接失败
+### Q2: ChromeDriver 自动下载失败
+
+webdriver-manager 会自动下载 ChromeDriver，如果失败可以手动指定：
+
+```python
+# 在 crawler.py 中可以手动设置 ChromeDriver 路径
+from selenium.webdriver.chrome.service import Service
+service = Service('/path/to/chromedriver')
+driver = webdriver.Chrome(service=service)
+```
+
+### Q3: 代理连接失败
 
 - 检查代理格式是否正确
 - 确认代理服务器正常运行
 - 检查防火墙设置
 
-### Q3: 图片下载失败
+### Q4: 图片下载失败
 
 - 检查网络连接
 - 尝试降低并发数（--workers）
 - 增加请求延迟
 
-### Q4: 内存占用过高
+### Q5: 内存占用过高
 
 - 减少并发线程数（--workers）
 - 减少最大页面数（--max-pages）
