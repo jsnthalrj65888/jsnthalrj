@@ -10,7 +10,14 @@ import requests
 from bs4 import BeautifulSoup
 from PIL import Image
 from io import BytesIO
-from playwright.sync_api import sync_playwright
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from webdriver_manager.chrome import ChromeDriverManager
 from urllib.robotparser import RobotFileParser
 from tqdm import tqdm
 
@@ -20,7 +27,7 @@ from logger_config import setup_logger
 
 
 class ImageCrawler:
-    """图片爬虫类"""
+    """图片爬虫类 - Selenium版本"""
     
     def __init__(self, config: Config):
         self.config = config
@@ -111,8 +118,121 @@ class ImageCrawler:
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
     
+    def _create_driver(self, proxy_config=None):
+        """创建WebDriver（Selenium版本替代Playwright浏览器）"""
+        chrome_options = Options()
+        
+        # 基础选项
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--disable-web-security')
+        chrome_options.add_argument('--allow-running-insecure-content')
+        
+        # 设置User-Agent
+        user_agent = random.choice(self.config.USER_AGENTS)
+        chrome_options.add_argument(f'--user-agent={user_agent}')
+        
+        # 视窗大小设置
+        chrome_options.add_argument('--window-size=1920,1080')
+        
+        # 代理设置
+        if proxy_config:
+            chrome_options.add_argument(f'--proxy-server={proxy_config["server"]}')
+            self.logger.debug(f"使用代理: {proxy_config['server']}")
+        
+        # 无头模式设置
+        if self.config.HEADLESS:
+            chrome_options.add_argument('--headless')
+        
+        # 设置页面加载超时
+        chrome_options.add_argument('--page-load-timeout=30')
+        
+        # 禁用图片加载以提高速度（可选）
+        # chrome_options.add_argument('--disable-images')
+        
+        try:
+            # 使用WebDriverManager自动管理ChromeDriver
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+            
+            # 设置页面加载超时
+            driver.set_page_load_timeout(self.config.TIMEOUT)
+            
+            # 设置脚本执行超时
+            driver.set_script_timeout(self.config.TIMEOUT)
+            
+            # 设置隐式等待
+            driver.implicitly_wait(10)
+            
+            return driver
+            
+        except Exception as e:
+            self.logger.error(f"WebDriver创建失败: {str(e)}")
+            raise
+    
+    def _load_cookies(self, driver):
+        """加载Cookie到浏览器"""
+        if not self.cookies:
+            return
+            
+        try:
+            for cookie in self.cookies:
+                try:
+                    # Selenium Cookie格式与Playwright不同，需要转换
+                    cookie_dict = {
+                        'name': cookie.get('name'),
+                        'value': cookie.get('value')
+                    }
+                    
+                    # 添加可选字段
+                    if cookie.get('domain'):
+                        cookie_dict['domain'] = cookie['domain']
+                    if cookie.get('path'):
+                        cookie_dict['path'] = cookie['path']
+                    if cookie.get('secure') is not None:
+                        cookie_dict['secure'] = cookie['secure']
+                    if cookie.get('expiry'):
+                        cookie_dict['expiry'] = cookie['expiry']
+                    
+                    driver.add_cookie(cookie_dict)
+                except Exception as e:
+                    self.logger.warning(f"添加Cookie失败: {str(e)}")
+                    continue
+                    
+            self.logger.info(f"成功加载 {len(self.cookies)} 条Cookie")
+            
+        except Exception as e:
+            self.logger.warning(f"加载Cookie时出错: {str(e)}")
+    
+    def _wait_for_page_load(self, driver, url):
+        """等待页面加载完成"""
+        try:
+            # 等待页面标题变化，表示页面开始加载
+            WebDriverWait(driver, 10).until(
+                lambda d: d.execute_script("return document.readyState") in ["complete", "interactive"]
+            )
+            
+            # 等待网络空闲（通过检查是否有未完成的请求）
+            WebDriverWait(driver, 15).until(
+                lambda d: d.execute_script("return performance.now()") > 0
+            )
+            
+            # 执行滚动操作触发懒加载
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(2)
+            
+            # 再次滚动确保触发所有懒加载
+            driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(1)
+            
+        except TimeoutException:
+            self.logger.warning(f"页面加载超时: {url}")
+        except Exception as e:
+            self.logger.warning(f"页面加载等待异常: {str(e)}")
+    
     def crawl_page(self, url: str, depth: int = 0) -> List[str]:
-        """爬取单个页面，返回页面中的链接"""
+        """爬取单个页面，返回页面中的链接（Selenium版本）"""
         if depth > self.config.MAX_DEPTH:
             self.logger.debug(f"达到最大深度，跳过: {url}")
             return []
@@ -132,66 +252,68 @@ class ImageCrawler:
         self.visited_urls.add(url)
         self.logger.info(f"爬取页面 (深度 {depth}): {url}")
 
+        driver = None
+        proxy_config = None
+        
         try:
-            with sync_playwright() as p:
-                browser_args = {
-                    'headless': self.config.HEADLESS,
-                }
+            # 获取代理配置
+            if self.proxy_manager:
+                proxy_config = self.proxy_manager.get_proxy()
+            
+            # 创建WebDriver
+            driver = self._create_driver(proxy_config)
+            
+            # 访问页面
+            self.logger.debug(f"正在加载页面: {url}")
+            driver.get(url)
+            
+            # 等待页面加载完成
+            self._wait_for_page_load(driver, url)
+            
+            # 获取页面内容
+            content = driver.page_source
+            
+            # 提取图片
+            image_urls = self._extract_images_from_page(content, url)
+            self.stats['images_found'] += len(image_urls)
+            self.logger.info(f"在页面中找到 {len(image_urls)} 张图片")
 
-                proxy_config = None
-                if self.proxy_manager:
-                    proxy_config = self.proxy_manager.get_proxy()
-                    if proxy_config:
-                        browser_args['proxy'] = proxy_config
-                        self.logger.debug(f"使用代理: {proxy_config['server']}")
+            # 下载图片
+            page_name = self._get_page_name(url)
+            self._download_images(image_urls, page_name)
 
-                browser = p.chromium.launch(**browser_args)
+            # 提取链接
+            links = self._extract_links_from_page(content, url)
 
-                context = browser.new_context(
-                    user_agent=random.choice(self.config.USER_AGENTS),
-                    viewport={'width': 1920, 'height': 1080}
-                )
+            self.stats['pages_crawled'] += 1
+            
+            # 标记代理成功（如果使用了代理）
+            if self.proxy_manager and proxy_config:
+                self.proxy_manager.mark_proxy_success()
+            
+            return links
 
-                if self.cookies:
-                    context.add_cookies(self.cookies)
-
-                page = context.new_page()
-                page.set_default_timeout(self.config.TIMEOUT * 1000)
-
-                try:
-                    page.goto(url, wait_until='networkidle')
-
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    time.sleep(1)
-
-                    content = page.content()
-
-                    image_urls = self._extract_images_from_page(content, url)
-                    self.stats['images_found'] += len(image_urls)
-                    self.logger.info(f"在页面中找到 {len(image_urls)} 张图片")
-
-                    page_name = self._get_page_name(url)
-                    self._download_images(image_urls, page_name)
-
-                    links = self._extract_links_from_page(content, url)
-
-                    self.stats['pages_crawled'] += 1
-
-                    return links
-
-                except Exception as e:
-                    self.logger.error(f"页面加载失败 {url}: {str(e)}")
-                    if self.proxy_manager and proxy_config:
-                        self.proxy_manager.mark_proxy_failed()
-                    return []
-                finally:
-                    browser.close()
-
+        except WebDriverException as e:
+            self.logger.error(f"WebDriver错误 {url}: {str(e)}")
+            if self.proxy_manager and proxy_config:
+                self.proxy_manager.mark_proxy_failed()
+            return []
         except Exception as e:
-            self.logger.error(f"浏览器启动失败: {str(e)}")
+            self.logger.error(f"页面处理失败 {url}: {str(e)}")
+            if self.proxy_manager and proxy_config:
+                self.proxy_manager.mark_proxy_failed()
             return []
         finally:
-            self._random_delay()
+            # 关闭浏览器
+            if driver:
+                try:
+                    driver.quit()
+                except Exception as e:
+                    self.logger.warning(f"关闭WebDriver时出错: {str(e)}")
+        
+        # 添加随机延迟
+        self._random_delay()
+        return []
     
     def _extract_images_from_page(self, html: str, base_url: str) -> List[str]:
         """从页面中提取图片URL"""
@@ -368,7 +490,7 @@ class ImageCrawler:
     def crawl(self):
         """开始爬取"""
         self.logger.info(f"=" * 60)
-        self.logger.info(f"开始爬取: {self.config.START_URL}")
+        self.logger.info(f"开始爬取 (Selenium版本): {self.config.START_URL}")
         self.logger.info(f"最大深度: {self.config.MAX_DEPTH}, 最大页面数: {self.config.MAX_PAGES}")
         self.logger.info(f"输出目录: {self.config.OUTPUT_DIR}")
         self.logger.info(f"使用代理: {self.config.USE_PROXY}")

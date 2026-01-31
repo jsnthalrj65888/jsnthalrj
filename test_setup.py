@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-测试脚本 - 验证爬虫系统的基本功能
+测试脚本 - 验证爬虫系统的基本功能 (Selenium版本)
 """
 import os
 import sys
@@ -35,7 +35,8 @@ def test_dependencies():
     """测试依赖包是否已安装"""
     print("\n测试依赖包...")
     dependencies = [
-        'playwright',
+        'selenium',
+        'webdriver_manager',
         'requests',
         'bs4',
         'PIL',
@@ -54,6 +55,34 @@ def test_dependencies():
             all_ok = False
     
     return all_ok
+
+
+def test_selenium_webdriver():
+    """测试Selenium WebDriver是否可以工作"""
+    print("\n测试Selenium WebDriver...")
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.service import Service
+        from selenium.webdriver.chrome.options import Options
+        from webdriver_manager.chrome import ChromeDriverManager
+        
+        # 测试Chrome选项
+        options = Options()
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        
+        # 测试webdriver-manager
+        service = Service(ChromeDriverManager().install())
+        
+        print("✓ Selenium WebDriver 配置正常")
+        print("✓ webdriver-manager 可用")
+        
+        return True
+    except Exception as e:
+        print(f"✗ Selenium WebDriver 测试失败: {e}")
+        print("请确保已安装 Chrome 浏览器")
+        return False
 
 
 def test_config():
@@ -151,6 +180,7 @@ def main():
         ("目录结构", test_directories),
         ("模块导入", test_imports),
         ("依赖包", test_dependencies),
+        ("Selenium WebDriver", test_selenium_webdriver),
         ("配置", test_config),
         ("日志系统", test_logger),
         ("代理管理器", test_proxy_manager),
@@ -185,7 +215,9 @@ def main():
         print("✗ 部分测试失败，请检查上述错误。")
         print("\n安装依赖:")
         print("  pip install -r requirements.txt")
-        print("  playwright install chromium")
+        print("\n确保安装Chrome浏览器:")
+        print("  Ubuntu/Debian: sudo apt-get install google-chrome-stable")
+        print("  Windows: 下载安装 https://www.google.com/chrome/")
         return 1
 
 

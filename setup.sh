@@ -1,8 +1,8 @@
 #!/bin/bash
-# 自动化安装脚本
+# 自动化安装脚本 (Selenium版本)
 
 echo "================================"
-echo "图片爬虫系统 - 自动安装"
+echo "图片爬虫系统 - 自动安装 (Selenium版本)"
 echo "================================"
 
 # 检查Python版本
@@ -31,10 +31,24 @@ pip install -q --upgrade pip
 pip install -q -r requirements.txt
 echo "✓ Python依赖已安装"
 
-# 安装Playwright浏览器
-echo -e "\n安装Playwright浏览器..."
-playwright install chromium
-echo "✓ Playwright浏览器已安装"
+# 检查Chrome浏览器
+echo -e "\n检查Chrome浏览器..."
+if command -v google-chrome &> /dev/null; then
+    CHROME_VERSION=$(google-chrome --version)
+    echo "✓ $CHROME_VERSION"
+    echo "✓ Chrome浏览器已安装"
+elif command -v chromium-browser &> /dev/null; then
+    CHROMIUM_VERSION=$(chromium-browser --version)
+    echo "✓ $CHROMIUM_VERSION"
+    echo "✓ Chromium浏览器已安装"
+else
+    echo "⚠ 警告: 未检测到Chrome/Chromium浏览器"
+    echo "请安装Chrome浏览器:"
+    echo "  Ubuntu/Debian: sudo apt-get install google-chrome-stable"
+    echo "  CentOS/RHEL: sudo yum install google-chrome-stable"
+    echo "  macOS: brew install --cask google-chrome"
+    echo "  Windows: 下载并安装 https://www.google.com/chrome/"
+fi
 
 # 创建配置文件
 echo -e "\n创建配置文件..."
@@ -65,4 +79,5 @@ echo "   cp proxies.txt.example proxies.txt"
 echo "   # 编辑 proxies.txt 添加代理"
 echo "   python main.py --use-proxy"
 echo ""
+echo "注意: Selenium版本会自动管理ChromeDriver，无需手动安装"
 echo "================================"

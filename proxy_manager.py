@@ -49,6 +49,14 @@ class ProxyManager:
             self.failed_proxies[proxy_url] = time.time()
             self.logger.warning(f"代理标记为失败: {proxy_url}")
     
+    def mark_proxy_success(self, proxy_url: Optional[str] = None):
+        """标记代理成功（用于统计）"""
+        if proxy_url is None:
+            proxy_url = self.current_proxy
+        
+        if proxy_url:
+            self.logger.debug(f"代理使用成功: {proxy_url}")
+    
     def _clean_failed_proxies(self, timeout=300):
         """清理超时的失败代理，使其可以重新使用"""
         current_time = time.time()
