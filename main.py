@@ -23,15 +23,22 @@ def parse_arguments():
     parser.add_argument(
         '--url',
         type=str,
-        default=Config.START_URL,
-        help=f'起始URL (默认: {Config.START_URL})'
+        default='https://8se.me/photos/sort-hot.html',
+        help='列表页URL (默认: https://8se.me/photos/sort-hot.html)'
+    )
+    
+    parser.add_argument(
+        '--list-pages',
+        type=int,
+        default=Config.LIST_PAGES,
+        help=f'要爬取的列表页数量 (默认: {Config.LIST_PAGES})'
     )
     
     parser.add_argument(
         '--depth',
         type=int,
-        default=Config.MAX_DEPTH,
-        help=f'最大爬取深度 (默认: {Config.MAX_DEPTH})'
+        default=Config.DETAIL_DEPTH,
+        help=f'套图详情页分页深度 (默认: {Config.DETAIL_DEPTH})'
     )
     
     parser.add_argument(
@@ -113,7 +120,8 @@ def main():
         args = parse_arguments()
         
         Config.START_URL = args.url
-        Config.MAX_DEPTH = args.depth
+        Config.LIST_PAGES = args.list_pages
+        Config.DETAIL_DEPTH = args.depth
         Config.MAX_PAGES = args.max_pages
         Config.OUTPUT_DIR = args.output
         Config.MAX_WORKERS = args.workers
@@ -131,8 +139,8 @@ def main():
                 logger.warning("启用了代理但代理列表为空，请检查 config.py 或代理文件")
         
         logger.info("图片爬虫启动")
-        logger.info(f"配置: URL={Config.START_URL}, 深度={Config.MAX_DEPTH}, "
-                   f"最大页面数={Config.MAX_PAGES}, 使用代理={Config.USE_PROXY}")
+        logger.info(f"配置: URL={Config.START_URL}, 列表页数={Config.LIST_PAGES}, "
+                   f"套图深度={Config.DETAIL_DEPTH}, 使用代理={Config.USE_PROXY}")
         
         crawler = ImageCrawler(Config)
         
