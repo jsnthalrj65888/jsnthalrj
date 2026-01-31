@@ -4,8 +4,10 @@ import random
 import hashlib
 import re
 import base64
+import json
+from datetime import datetime
 from urllib.parse import urljoin, urlparse
-from typing import Set, List
+from typing import Set, List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -56,6 +58,12 @@ class ImageCrawler:
             'images_skipped': 0,
             'start_time': time.time()
         }
+        
+        # 套图追踪列表
+        self.photo_sets: List[Dict] = []
+        
+        # 失败的下载记录
+        self.failed_downloads: Dict[str, List[Dict]] = {}
 
         self.cookies = self.config.load_cookies()
         if self.cookies:
@@ -270,6 +278,172 @@ class ImageCrawler:
         url_hash = hashlib.md5(url.encode()).hexdigest()
         ext = os.path.splitext(urlparse(url).path)[1] or '.jpg'
         return f"{url_hash}{ext}"
+    
+    def _load_photo_metadata(self, photo_folder: str) -> Optional[Dict]:
+        """读取套图元数据（用于恢复下载）"""
+        metadata_path = os.path.join(photo_folder, 'metadata.json')
+        if not os.path.exists(metadata_path):
+            return None
+        
+        try:
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+            self.logger.info(f"加载已存在的元数据: {photo_folder}")
+            return metadata
+        except Exception as e:
+            self.logger.warning(f"加载元数据失败 {metadata_path}: {e}")
+            return None
+    
+    def _save_photo_metadata(self, photo_folder: str, metadata: Dict):
+        """保存套图元数据"""
+        metadata_path = os.path.join(photo_folder, 'metadata.json')
+        try:
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+            self.logger.debug(f"保存元数据: {metadata_path}")
+        except Exception as e:
+            self.logger.error(f"保存元数据失败 {metadata_path}: {e}")
+    
+    def _update_photo_metadata(self, photo_folder: str, photo_id: str, photo_url: str, 
+                              title: str = None, total_pages: int = None):
+        """更新套图元数据"""
+        metadata = self._load_photo_metadata(photo_folder) or {}
+        
+        # 初始化或更新基本信息
+        if not metadata:
+            metadata = {
+                'title': title or f'套图 {photo_id}',
+                'photo_id': photo_id,
+                'photo_url': photo_url,
+                'total_pages': total_pages or 0,
+                'total_images': 0,
+                'download_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'images_downloaded': 0,
+                'images_failed': 0,
+                'image_files': [],
+                'failed_images': []
+            }
+        else:
+            # 更新时间戳
+            metadata['last_update'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            if title:
+                metadata['title'] = title
+            if total_pages:
+                metadata['total_pages'] = total_pages
+        
+        # 统计当前文件夹中的图片
+        image_files = []
+        if os.path.exists(photo_folder):
+            for filename in os.listdir(photo_folder):
+                if filename.lower().endswith(tuple(f'.{fmt}' for fmt in self.config.ALLOWED_IMAGE_FORMATS)):
+                    image_files.append(filename)
+        
+        metadata['image_files'] = sorted(image_files)
+        metadata['images_downloaded'] = len(image_files)
+        
+        # 更新失败记录
+        if photo_id in self.failed_downloads:
+            metadata['failed_images'] = self.failed_downloads[photo_id]
+            metadata['images_failed'] = len(self.failed_downloads[photo_id])
+        
+        # 保存元数据
+        self._save_photo_metadata(photo_folder, metadata)
+        
+        return metadata
+    
+    def _generate_download_summary(self):
+        """生成下载摘要报告"""
+        elapsed_time = time.time() - self.stats['start_time']
+        
+        # 计算平均值
+        avg_images = 0
+        if len(self.photo_sets) > 0:
+            total_images = sum(p.get('images_count', 0) for p in self.photo_sets)
+            avg_images = total_images / len(self.photo_sets)
+        
+        # 统计成功和失败的套图
+        photo_sets_downloaded = sum(1 for p in self.photo_sets if p.get('status') == 'success')
+        photo_sets_failed = sum(1 for p in self.photo_sets if p.get('status') == 'failed')
+        
+        summary = {
+            'run_date': datetime.fromtimestamp(self.stats['start_time']).strftime('%Y-%m-%d %H:%M:%S'),
+            'total_duration_seconds': int(elapsed_time),
+            'list_pages_crawled': self.config.LIST_PAGES,
+            'photo_sets_found': self.stats['photos_found'],
+            'photo_sets_downloaded': photo_sets_downloaded,
+            'photo_sets_failed': photo_sets_failed,
+            'total_images_downloaded': self.stats['images_downloaded'],
+            'total_images_failed': self.stats['images_failed'],
+            'total_images_skipped': self.stats['images_skipped'],
+            'average_images_per_set': round(avg_images, 2),
+            'photos': self.photo_sets
+        }
+        
+        summary_path = os.path.join(self.config.OUTPUT_DIR, 'download_summary.json')
+        try:
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+            self.logger.info(f"下载摘要已保存: {summary_path}")
+            
+            # 同时生成一个美化的文本版本
+            self._generate_summary_text(summary, elapsed_time)
+            
+            return summary_path
+        except Exception as e:
+            self.logger.error(f"保存下载摘要失败: {e}")
+            return None
+    
+    def _generate_summary_text(self, summary: Dict, elapsed_time: float):
+        """生成美化的文本摘要"""
+        summary_text_path = os.path.join(self.config.OUTPUT_DIR, 'download_summary.txt')
+        try:
+            with open(summary_text_path, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write("                        下载摘要报告\n")
+                f.write("=" * 80 + "\n\n")
+                
+                f.write(f"运行时间: {summary['run_date']}\n")
+                f.write(f"总耗时: {elapsed_time:.2f} 秒 ({int(elapsed_time // 60)} 分 {int(elapsed_time % 60)} 秒)\n\n")
+                
+                f.write("-" * 80 + "\n")
+                f.write("统计信息\n")
+                f.write("-" * 80 + "\n")
+                f.write(f"列表页爬取数: {summary['list_pages_crawled']}\n")
+                f.write(f"套图发现数: {summary['photo_sets_found']}\n")
+                f.write(f"套图下载成功: {summary['photo_sets_downloaded']}\n")
+                f.write(f"套图下载失败: {summary['photo_sets_failed']}\n")
+                f.write(f"图片下载成功: {summary['total_images_downloaded']}\n")
+                f.write(f"图片下载失败: {summary['total_images_failed']}\n")
+                f.write(f"图片跳过: {summary['total_images_skipped']}\n")
+                f.write(f"平均每套图片数: {summary['average_images_per_set']:.2f}\n\n")
+                
+                if summary['photo_sets_found'] > 0:
+                    success_rate = (summary['photo_sets_downloaded'] / summary['photo_sets_found']) * 100
+                    f.write(f"套图下载成功率: {success_rate:.2f}%\n")
+                
+                if summary['total_images_downloaded'] + summary['total_images_failed'] > 0:
+                    img_success_rate = (summary['total_images_downloaded'] / 
+                                       (summary['total_images_downloaded'] + summary['total_images_failed'])) * 100
+                    f.write(f"图片下载成功率: {img_success_rate:.2f}%\n")
+                
+                f.write("\n" + "-" * 80 + "\n")
+                f.write("套图详情\n")
+                f.write("-" * 80 + "\n\n")
+                
+                for idx, photo in enumerate(summary['photos'], 1):
+                    status_symbol = "✓" if photo['status'] == 'success' else "✗"
+                    f.write(f"{idx}. [{status_symbol}] {photo['title']}\n")
+                    f.write(f"   ID: {photo['photo_id']}\n")
+                    f.write(f"   图片数: {photo['images_count']}\n")
+                    if photo.get('images_failed', 0) > 0:
+                        f.write(f"   失败数: {photo['images_failed']}\n")
+                    f.write("\n")
+                
+                f.write("=" * 80 + "\n")
+            
+            self.logger.info(f"文本摘要已保存: {summary_text_path}")
+        except Exception as e:
+            self.logger.error(f"保存文本摘要失败: {e}")
 
     def _download_image_via_selenium(self, driver, img_url, photo_id, output_dir):
         """
@@ -376,6 +550,10 @@ class ImageCrawler:
 
     def _crawl_photo_detail(self, photo_url: str, max_pages: int):
         """爬取单个套图的详情页（可能有多个分页）"""
+        photo_start_time = time.time()
+        photo_title = None
+        photo_id = None
+        
         try:
             # 提取 photo_id
             # 示例: https://8se.me/photo/id-697cc68a53ac0.html -> 697cc68a53ac0
@@ -390,6 +568,12 @@ class ImageCrawler:
             output_dir = os.path.join(self.config.OUTPUT_DIR, photo_id)
             if not os.path.exists(output_dir):
                 os.makedirs(output_dir)
+            
+            # 检查是否已有元数据（支持断点续传）
+            existing_metadata = self._load_photo_metadata(output_dir)
+            if existing_metadata:
+                self.logger.info(f"发现已存在的下载，继续下载: {photo_id}")
+                photo_title = existing_metadata.get('title')
             
             # 使用同一个driver处理所有分页，减少启动开销
             driver = None
@@ -411,6 +595,15 @@ class ImageCrawler:
                         time.sleep(self.config.MIN_DELAY) # 使用配置的延迟
                         
                         soup = BeautifulSoup(driver.page_source, 'html.parser')
+                        
+                        # 第一页时提取标题
+                        if page == 1 and not photo_title:
+                            title_elem = soup.find('h1')
+                            if not title_elem:
+                                title_elem = soup.find('title')
+                            if title_elem:
+                                photo_title = title_elem.get_text(strip=True)
+                                self.logger.info(f"  套图标题: {photo_title}")
                         
                         # 提取该分页的所有图片
                         photo_images = soup.find_all('div', class_='item photo-image')
@@ -458,17 +651,74 @@ class ImageCrawler:
                         
                 if self.proxy_manager and proxy_config:
                     self.proxy_manager.mark_proxy_success()
+                
+                # 更新元数据
+                metadata = self._update_photo_metadata(
+                    output_dir, 
+                    photo_id, 
+                    photo_url, 
+                    title=photo_title, 
+                    total_pages=max_pages
+                )
+                
+                # 添加到套图列表
+                photo_duration = time.time() - photo_start_time
+                photo_info = {
+                    'title': photo_title or f'套图 {photo_id}',
+                    'photo_id': photo_id,
+                    'photo_url': photo_url,
+                    'status': 'success',
+                    'images_count': metadata['images_downloaded'],
+                    'images_failed': metadata.get('images_failed', 0),
+                    'total_pages': max_pages,
+                    'duration_seconds': int(photo_duration)
+                }
+                self.photo_sets.append(photo_info)
+                self.logger.info(f"套图 {photo_id} 下载完成，成功 {metadata['images_downloaded']} 张，失败 {metadata.get('images_failed', 0)} 张")
                     
             except Exception as e:
                 self.logger.error(f"处理套图详情页出错 {photo_url}: {e}")
                 if self.proxy_manager and proxy_config:
                     self.proxy_manager.mark_proxy_failed()
+                
+                # 标记为失败的套图
+                if photo_id:
+                    metadata = self._update_photo_metadata(
+                        output_dir, 
+                        photo_id, 
+                        photo_url, 
+                        title=photo_title, 
+                        total_pages=max_pages
+                    )
+                    photo_info = {
+                        'title': photo_title or f'套图 {photo_id}',
+                        'photo_id': photo_id,
+                        'photo_url': photo_url,
+                        'status': 'failed',
+                        'images_count': metadata.get('images_downloaded', 0),
+                        'images_failed': metadata.get('images_failed', 0),
+                        'error': str(e),
+                        'duration_seconds': int(time.time() - photo_start_time)
+                    }
+                    self.photo_sets.append(photo_info)
             finally:
                 if driver:
                     driver.quit()
         
         except Exception as e:
             self.logger.error(f"处理套图详情页逻辑出错 {photo_url}: {e}")
+            # 记录失败的套图
+            if photo_id:
+                photo_info = {
+                    'title': photo_title or f'套图 {photo_id}',
+                    'photo_id': photo_id,
+                    'photo_url': photo_url,
+                    'status': 'failed',
+                    'images_count': 0,
+                    'error': str(e),
+                    'duration_seconds': int(time.time() - photo_start_time)
+                }
+                self.photo_sets.append(photo_info)
 
     def crawl_page(self, url: str, depth: int = 0) -> List[str]:
         """爬取单个页面，返回页面中的链接（Selenium版本）"""
@@ -923,6 +1173,18 @@ class ImageCrawler:
         # 所有重试都失败了
         self.stats['images_failed'] += 1
         self.logger.error(f"最终下载失败，已放弃: {url}")
+        
+        # 记录失败的下载
+        if photo_id:
+            if photo_id not in self.failed_downloads:
+                self.failed_downloads[photo_id] = []
+            self.failed_downloads[photo_id].append({
+                'url': url,
+                'filename': filename,
+                'reason': '下载失败（所有重试均失败）',
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            })
+        
         return False
     
     def crawl(self):
@@ -1006,6 +1268,12 @@ class ImageCrawler:
             self.logger.error(f"爬虫执行出错: {e}")
         finally:
             self._print_stats()
+            # 生成下载摘要
+            summary_path = self._generate_download_summary()
+            if summary_path:
+                self.logger.info(f"\n{'='*60}")
+                self.logger.info(f"下载摘要已生成: {summary_path}")
+                self.logger.info(f"{'='*60}\n")
     
     def _print_stats(self):
         """打印统计信息"""
@@ -1014,18 +1282,29 @@ class ImageCrawler:
         self.logger.info(f"\n" + "=" * 60)
         self.logger.info(f"爬取完成！统计信息:")
         self.logger.info(f"=" * 60)
-        self.logger.info(f"总耗时: {elapsed_time:.2f} 秒")
+        self.logger.info(f"总耗时: {elapsed_time:.2f} 秒 ({int(elapsed_time // 60)} 分 {int(elapsed_time % 60)} 秒)")
         self.logger.info(f"列表页爬取数: {self.config.LIST_PAGES}")
         self.logger.info(f"总页面爬取数: {self.stats['pages_crawled']}")
         self.logger.info(f"套图发现数: {self.stats['photos_found']}")
+        
+        # 套图统计
+        photo_sets_downloaded = sum(1 for p in self.photo_sets if p.get('status') == 'success')
+        photo_sets_failed = sum(1 for p in self.photo_sets if p.get('status') == 'failed')
+        self.logger.info(f"套图下载成功: {photo_sets_downloaded}")
+        self.logger.info(f"套图下载失败: {photo_sets_failed}")
+        
         self.logger.info(f"图片发现数: {self.stats['images_found']}")
         self.logger.info(f"图片下载成功: {self.stats['images_downloaded']}")
         self.logger.info(f"图片下载失败: {self.stats['images_failed']}")
         self.logger.info(f"图片跳过: {self.stats['images_skipped']}")
         
+        if self.stats['photos_found'] > 0:
+            photo_success_rate = (photo_sets_downloaded / self.stats['photos_found']) * 100
+            self.logger.info(f"套图下载成功率: {photo_success_rate:.2f}%")
+        
         if self.stats['images_found'] > 0:
             success_rate = (self.stats['images_downloaded'] / self.stats['images_found']) * 100
-            self.logger.info(f"下载成功率: {success_rate:.2f}%")
+            self.logger.info(f"图片下载成功率: {success_rate:.2f}%")
         
         if self.proxy_manager:
             proxy_stats = self.proxy_manager.get_stats()
