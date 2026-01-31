@@ -29,6 +29,9 @@
 - ✅ robots.txt 支持
 - ✅ 动态内容加载
 - ✅ 详细的统计信息
+- ✅ **元数据管理**: 自动保存套图信息和下载统计
+- ✅ **下载摘要**: 生成JSON和文本格式的下载报告
+- ✅ **失败追踪**: 记录所有失败的下载及原因
 
 ## 📋 系统要求
 
@@ -226,10 +229,17 @@ image-crawler/
 ├── .env.example            # 环境变量示例
 ├── proxies.txt.example     # 代理列表示例
 ├── README.md               # 说明文档
+├── METADATA_FEATURE.md     # 元数据功能文档
 ├── output/                 # 图片输出目录（自动创建）
-│   ├── page1/
-│   ├── page2/
-│   └── ...
+│   ├── download_summary.json    # 下载摘要（JSON）
+│   ├── download_summary.txt     # 下载摘要（文本）
+│   ├── photo_id_1/              # 套图文件夹
+│   │   ├── metadata.json        # 套图元数据
+│   │   ├── image1.jpg
+│   │   └── ...
+│   └── photo_id_2/
+│       ├── metadata.json
+│       └── ...
 └── logs/                   # 日志目录（自动创建）
     └── crawler_*.log
 ```
@@ -304,14 +314,32 @@ proxy_manager.test_all_proxies()
 
 ```
 output/
-├── index/                  # 首页图片
+├── download_summary.json   # 下载摘要（JSON格式）
+├── download_summary.txt    # 下载摘要（文本格式）
+├── photo_id_1/             # 套图文件夹
+│   ├── metadata.json      # 套图元数据
 │   ├── abc123.jpg
 │   └── def456.png
-├── gallery_photos/         # 相册页面图片
+├── photo_id_2/             # 套图文件夹
+│   ├── metadata.json
 │   ├── img001.jpg
 │   └── img002.jpg
 └── ...
 ```
+
+### 元数据和统计
+
+每个套图文件夹都包含 `metadata.json`，记录：
+- 套图标题和ID
+- 下载时间和状态
+- 图片数量统计
+- 失败记录
+
+下载完成后生成全局摘要：
+- `download_summary.json`: 机器可读的JSON格式
+- `download_summary.txt`: 人类可读的文本格式
+
+**详细文档**: 参见 [METADATA_FEATURE.md](METADATA_FEATURE.md)
 
 ### 日志文件
 
